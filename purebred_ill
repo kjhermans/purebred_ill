@@ -1,0 +1,443 @@
+#!/usr/bin/perl
+
+##
+#
+# Purebred Ill - Perl Builder, 'make' alternative.
+#
+# How does it work?
+#
+# The script runs down the directory tree, to gather how many stages there are.
+# For each stage, the script runs down the directory tree, gathering what
+# files have to be transformed, and how. This is described in a per-directory
+# file calles 'purebred.ill'. It will transform when the destination
+# file is not there, there is no entry in the cache, or when the signature
+# in the cache differs from the one calculated.
+#
+# Usage $0 [-t|-d] [-T <target>] [-E <name>]* [dir]
+#
+# Where:
+# -t       Terse output. Only on failure, output the offending command.
+# -d       Debug output. Be very verbose.
+# -E       Set overriding environment variable name.
+# <name>   Is an environment variable name, which takes precedence over
+#          any such variables defined in the purebred.ill files.
+# [dir]    Top directory to search down in order to build. Defaults to '.'.
+# <target> Specify a different target from the default at top level.
+#
+# Purebred file structure.
+#
+# A purebred_ill file is always called 'purebred.ill' and contains a
+# perl hash as its last definition (so that it returns said perl hash
+# when it is eval-ed).
+#
+# The perl hash contains, as top nodes:
+# - inherit
+# - disregard_unless
+# - subdirs
+# - stage_N
+# - targets
+# - naming
+#
+##
+
+use Data::Dumper;
+use Digest::MD5 qw(md5_hex);
+
+my $terse = 0;
+my $debug = 0;
+my $pwd = `pwd`; $pwd =~ s/\r?\n$//;
+$ENV{PIROOT} = $pwd;
+
+my $dir = '.';
+my $target;
+my $overide_env = { 'PIROOT' => $pwd };
+while (scalar(@ARGV)) {
+  my $arg = shift @ARGV;
+  if ($arg =~ /^-E$/) {
+    my $name = shift @ARGV;
+    $override_env->{$name} = $ENV{$name};
+  } elsif ($arg =~ /^-t$/) {
+    $terse = 1;
+  } elsif ($arg =~ /^-d$/) {
+    $debug = 1;
+  } elsif ($arg =~ /^-T$/) {
+    $target = shift @ARGV;
+  } else {
+    $dir = $arg;
+    last;
+  }
+}
+
+my @jobs;
+my %stagenames;
+my $cacheperl = `cat $dir/.purebred.ill.cache`;
+my $cache = eval($cacheperl) || { };
+if ($@) {
+  print STDERR "WARNING: Unpacking cache: $@\n";
+}
+my $newcache = eval(Dumper($cache));
+
+print STDERR "Assuming top directory $dir\n";
+if ($target) {
+  print STDERR "Target $target.\n";
+}
+my %dirmap;
+my @dirs = gather_dirs($dir, { env => $override_env });
+
+my $stages = gather_stages(@dirs);
+
+for (my $stage=0; $stage <= $stages; $stage++) {
+  print STDERR "\n---- STAGE $stage. " . $stagenames{"stage_" . $stage} . "\n";
+  push @jobs, gather_work($stage, \@dirs);
+  execute_jobs();
+}
+
+sub END {
+  open CACHE, "> $dir/.purebred.ill.cache";
+  print CACHE Dumper($newcache);
+  close CACHE;
+}
+
+exit 0;
+
+##---- functions ----------------------------------------------------------##
+
+sub disregard_unless
+{
+  my $condition = shift;
+  if ($debug) {
+    print STDERR "EXAMINING $condition\n";
+  }
+  if ($condition =~ s/^SHELL://) {
+    return (system($condition));
+  }
+}
+
+sub gather_dirs
+{
+  my $dir = shift;
+  if ($debug) {
+    print STDERR "DIR $dir\n";
+  }
+  my $inherit = shift || { };
+  my $hash =  { };
+  my @result;
+  my $_dir;
+  if (-f "$dir/purebred.ill") {
+    my $desc = `cat $dir/purebred.ill`;
+    $hash = eval $desc;
+    if ($@) {
+      print STDERR "WARNING: Description in $dir/purebred.ill has errors: $@\n";
+    }
+  }
+  if (defined($target)) {
+    $hash = $hash->{targets}{$target};
+  }
+  if ($hash->{naming}) {
+    foreach my $key (keys(%{$hash->{naming}})) {
+      $stagenames{"$key"} = "$hash->{naming}{$key}";
+    }
+  }
+  if ($debug) {
+    use Data::Dumper; print STDERR Dumper $hash;
+  }
+  if ($hash->{disregard_unless}) {
+    if (disregard_unless($hash->{disregard_unless})) {
+      return;
+    }
+  }
+  $dirmap{$dir} = join_hash($inherit, $hash->{inherit});
+  if (opendir($_dir, $dir)) {
+    while (my $entry = readdir($_dir)) {
+      next if ($entry eq '.' || $entry eq '..');
+      next if (-f "$dir/$entry");
+      if (-d "$dir/$entry") {
+        next if ($hash->{subdirs}{$entry} eq 'ignore');
+        if ($hash->{subdirs}{$entry} =~ /^make($|\s+)/) {
+          push @jobs, {
+            dir => "$dir/$entry",
+            cmd => $hash->{subdirs}{$entry},
+            reason => 'make forced',
+          };
+          next;
+        }
+        push @result, gather_dirs("$dir/$entry", $dirmap{$dir});
+      }
+    }
+    closedir $_dir;
+  }
+  push @result, $dir;
+  return @result;
+}
+
+sub gather_stages
+{
+  my @dirs = @_;
+  my $nstages = 0;
+  foreach my $dir (@dirs) {
+    if (-f "$dir/purebred.ill") {
+      my $desc = `cat $dir/purebred.ill`;
+      my $hash = eval $desc;
+      if (defined($target)) {
+        $hash = $hash->{targets}{$target};
+      }
+      foreach my $key (keys(%{$hash})) {
+        if ($key =~ /^stage_([0-9]+)$/) {
+          my $n = $1;
+          if ($n > $nstages) {
+            $nstages = $n;
+          }
+        }
+      }
+    }
+  }
+  return $nstages;
+}
+
+sub gather_work
+{
+  my ($stage, $dirs) = @_;
+  my @result;
+  foreach my $dir (sort @{$dirs}) {
+    if (-f "$dir/purebred.ill") {
+      my $desc = `cat $dir/purebred.ill`;
+      my $hash = eval $desc;
+      my $section;
+      if (defined($target)) {
+        $hash = $hash->{targets}{$target};
+      }
+      next if (!defined($section = $hash->{"stage_" . $stage}));
+      my $njobs = 0;
+      if (!defined($section->{source}) && !defined($section->{destination})) {
+        push @result, {
+          dest => undef,
+          cmd => do_transform($dir, $section, undef, undef),
+          dir => $dir,
+          reason => "command always executed in stage $stage"
+        };
+        ++$njobs;
+        next;
+      }
+      my @sourcefiles = gather_files($dir, $section->{source});
+      my $depends;
+      foreach my $sourcefile (@sourcefiles) {
+        my $path = resolve_path($dir, $sourcefile);
+        if (! -f $path) {
+          print STDERR "\nERROR: Path $path missing in stage $stage\n";
+          exit -1;
+        }
+        my $source = `cat $path`;
+        my $md5 = md5_hex($source);
+        $newcache->{$stage}{"$dir/$sourcefile"} = $md5;
+        my $destinations = derive_destinations($dir, $sourcefile, $section);
+        foreach my $dest (keys(%{$destinations})) {
+          push @{$depends->{$dest}}, @{$destinations->{$dest}};
+        }
+      }
+      foreach my $dest (sort keys(%{$depends})) {
+        my @sourcechanged;
+        foreach my $source (@{$depends->{$dest}}) {
+          if (!defined($cache->{$stage}{"$dir/$source"})
+              || $cache->{$stage}{"$dir/$source"}
+                 ne $newcache->{$stage}{"$dir/$source"})
+          {
+            push @sourcechanged, "$dir/$source";
+          }
+        }
+        if (! -f "$dir/$dest" || scalar(@sourcechanged)) {
+#          if ($njobs == 0) {
+#            push @result, {
+#              cmd => "ECHODIR $dir",
+#            };
+#          }
+          next if ($section->{onlyonce} && $njobs > 0);
+          push @result, {
+            dest => $dest,
+            cmd => do_transform($dir, $section, $depends->{$dest}, $dest),
+            dir => $dir,
+            reason => (! -f "$dir/$dest") ?
+                        "destination ($dest) absent" :
+                        "source changed (" .
+                        sourcechanged_string(@sourcechanged) . ")"
+          };
+          ++$njobs;
+        }
+      }
+    }
+  }
+  return @result;
+}
+
+sub gather_files
+{
+  my ($dir, $cmd) = @_;
+  if ($cmd =~ s/^SHELL://g) {
+    my $files = `cd $dir && $cmd`;
+    $files =~ s/^\s+//;
+    $files =~ s/\s+$//;
+    my @files = split(/\n/, $files);
+    return @files;
+  } else {
+    my $files = $cmd;
+    $files =~ s/^\s+//;
+    $files =~ s/\s+$//;
+    my @files = split(/\s+/, $files);
+    return @files;
+  }
+}
+
+##
+## Returns a hash reference.
+## Input is a source file, output is a hash ref with derived destination(s)
+## as keys, and arrays of source files as values.
+##
+sub derive_destinations
+{
+  my ($dir, $source, $section) = @_;
+  my $dstfnc = $section->{destination};
+  if ($source =~ /\.c$/ && $dstfnc eq 'C2O') {
+    my $dest = "$source";
+    $dest =~ s/\.c$/.o/;
+    return { $dest => [ $source ] };
+  } elsif ($source =~ /\.c$/ && $dstfnc eq 'CDEP2O') {
+    my $dest = "$source";
+    $dest =~ s/\.c$/.o/;
+    my $cmd =
+      envstring($dirmap{$dir}{env}) .
+      "cd $dir \&\& gcc -M \$CFLAGS -c $source -o $dest";
+    my $sources = `$cmd`;
+    if ($debug) {
+      print STDERR "CMD $cmd\nSOURCES: $sources\n";
+    }
+    if ($sources =~ s/^$dest:\s*$source\s+//) {
+      $sources =~ s/\\\r?\n//g;
+      my @files = split(/\s+/, $sources);
+      return { $dest => [ @files ] };
+    } else {
+      return { $dest => [ $source ] };
+    }
+  } elsif ($source =~ /\.java$/ && $dstfnc eq 'J2C') {
+    my $dest = "$source";
+    $dest =~ s/\.java$/.class/;
+    return { $dest => [ $source ] };
+  } elsif ($dstfnc =~ s/^SHELL://) {
+    my $files = `cd $dir && $dstfnc`;
+    my @files = split(/\n+/, $files);
+    my $result = {};
+    foreach my $file (@files) {
+      push @{$result->{$file}}, $source;
+    }
+    return $result;
+  } elsif ($dstfnc =~ s/^PERLFUNC://) {
+    my $files = eval { &$dstfnc($source); };
+    return $files;
+  } else {
+    my @files = split(/[\n\t\r ]+/, $dstfnc);
+    my $result = {};
+    foreach my $file (@files) {
+      push @{$result->{$file}}, $source;
+    }
+    return $result;
+  }
+}
+
+sub do_transform
+{
+  my ($dir, $section, $sources, $dest) = @_;
+  my $transform = $section->{transform};
+  my $source = join(' ', @{$sources});
+  if ($transform =~ s/^SHELL://) {
+    $transform =~ s/IN/$source/g;
+    $transform =~ s/OUT/$dest/g;
+    $transform =~ s/DIR/$dir/g;
+    return $transform;
+  }
+}
+
+sub join_hash
+{
+  my ($hash1, $hash2) = @_;
+  my $result = eval(Dumper($hash1));
+  my $copy = eval(Dumper($hash2));
+  foreach my $key (keys(%{$copy->{env}})) {
+    next if ($override_env{$key});
+    $result->{env}{$key} = $copy->{env}{$key};
+  }
+  return $result;
+}
+
+sub execute_jobs
+{
+  while (scalar(@jobs)) {
+    my $job = shift @jobs;
+    execute_job($job);
+  }
+}
+
+sub execute_job
+{
+  my $job = shift;
+  if ($job->{cmd} =~ s/ECHODIR //) {
+    print "-- Directory: $job->{cmd}\n";
+    return;
+  }
+  my $cmd = envstring($dirmap{$job->{dir}}{env}) . $job->{cmd};
+  if ($terse) {
+    if ($job->{reason} =~ /^source changed/) {
+      print $job->{dest} . ': ';
+    }
+    print "$job->{reason}\n";
+  } else {
+    print "\n  In $job->{dir}, because $job->{reason}, do:\n$cmd\n";
+  }
+  if (system("cd $job->{dir}" . ' && ' . $cmd)) {
+    if ($terse) {
+      print STDERR "ERROR: $cmd\n";
+    }
+    exit -1;
+  }
+}
+
+sub envstring
+{
+  my $env = shift;
+  my $str = 'export ';
+  foreach my $key (keys(%{$env})) {
+    my $value = $env->{$key};
+    if ($value =~ s/^SHELL://) {
+      $value = `$value`; $value =~ s/\r?\n$//;
+    }
+    $str .= $key . "=$value ";
+  }
+  if ($str =~ /^export $/) {
+    return '';
+  }
+  return $str . '; ';
+}
+
+sub resolve_path
+{
+  my $dir = shift;
+  my $path = shift;
+  if ($path =~ /\$/) {
+    my $envstring = envstring($dirmap{$dir}{env});
+    my $cmd = $envstring . "echo -n \"$path\"";
+    $path = `$cmd`;
+  }
+  if ($path !~ /^\//) {
+    $path = "$dir/$path";
+  }
+  return $path;
+}
+
+sub sourcechanged_string
+{
+  my (@sources) = @_;
+  if (scalar(@sources) < 5) {
+    return join(', ', @sources);
+  } else {
+    return scalar(@sources) . " files";
+  }
+}
+
+1;
