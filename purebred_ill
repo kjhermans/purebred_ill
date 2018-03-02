@@ -42,6 +42,17 @@
 
 use Data::Dumper;
 use Digest::MD5 qw(md5_hex);
+use POSIX ":sys_wait_h";
+
+$SIG{CHLD} = sub {
+  while( ( my $child = waitpid( -1, &WNOHANG ) ) > 0 ) {
+    my $exitcode = $?;
+    if (int($exitcode)) {
+      print STDERR "Child $child exited with non zero";
+      exit -1;
+    }
+  }
+};
 
 my $terse = 0;
 my $debug = 0;
@@ -202,65 +213,73 @@ sub gather_work
     if (-f "$dir/purebred.ill") {
       my $desc = `cat $dir/purebred.ill`;
       my $hash = eval $desc;
-      my $section;
+      my $stagedef;
       if (defined($target)) {
         $hash = $hash->{targets}{$target};
       }
-      next if (!defined($section = $hash->{"stage_" . $stage}));
-      my $njobs = 0;
-      if (!defined($section->{source}) && !defined($section->{destination})) {
-        push @result, {
-          dest => undef,
-          cmd => do_transform($dir, $section, undef, undef),
-          dir => $dir,
-          reason => "command always executed in stage $stage"
-        };
-        ++$njobs;
-        next;
+      next if (!defined($stagedef = $hash->{"stage_" . $stage}));
+      if (ref $stagedef eq 'HASH') {
+        $stagedef = [ $stagedef ];
       }
-      my @sourcefiles = gather_files($dir, $section->{source});
-      my $depends;
-      foreach my $sourcefile (@sourcefiles) {
-        my $path = resolve_path($dir, $sourcefile);
-        if (! -f $path) {
-          print STDERR "\nERROR: Path $path missing in stage $stage\n";
-          exit -1;
-        }
-        my $source = `cat $path`;
-        my $md5 = md5_hex($source);
-        $newcache->{$stage}{"$dir/$sourcefile"} = $md5;
-        my $destinations = derive_destinations($dir, $sourcefile, $section);
-        foreach my $dest (keys(%{$destinations})) {
-          push @{$depends->{$dest}}, @{$destinations->{$dest}};
-        }
-      }
-      foreach my $dest (sort keys(%{$depends})) {
-        my @sourcechanged;
-        foreach my $source (@{$depends->{$dest}}) {
-          if (!defined($cache->{$stage}{"$dir/$source"})
-              || $cache->{$stage}{"$dir/$source"}
-                 ne $newcache->{$stage}{"$dir/$source"})
-          {
-            push @sourcechanged, "$dir/$source";
-          }
-        }
-        if (! -f "$dir/$dest" || scalar(@sourcechanged)) {
-#          if ($njobs == 0) {
-#            push @result, {
-#              cmd => "ECHODIR $dir",
-#            };
-#          }
-          next if ($section->{onlyonce} && $njobs > 0);
+      foreach my $section (@{$stagedef}) {
+        my $njobs = 0;
+        if (!defined($section->{source}) && !defined($section->{destination})) {
           push @result, {
-            dest => $dest,
-            cmd => do_transform($dir, $section, $depends->{$dest}, $dest),
+            dest => undef,
+            cmd => do_transform($dir, $section, undef, undef),
             dir => $dir,
-            reason => (! -f "$dir/$dest") ?
-                        "destination ($dest) absent" :
-                        "source changed (" .
-                        sourcechanged_string(@sourcechanged) . ")"
+            reason => "command always executed in stage $stage"
           };
           ++$njobs;
+          next;
+        }
+        my @sourcefiles = gather_files($dir, $section->{source});
+        my $depends;
+        foreach my $sourcefile (@sourcefiles) {
+          my $path = resolve_path($dir, $sourcefile);
+          if (! -f $path) {
+            print STDERR "\nERROR: Path $path missing in stage $stage\n";
+            exit -1;
+          }
+          my $source = `cat $path`;
+          my $md5 = md5_hex($source);
+          $newcache->{$stage}{"$dir/$sourcefile"} = $md5;
+          my $destinations = derive_destinations($dir, $sourcefile, $section);
+          foreach my $dest (keys(%{$destinations})) {
+            push @{$depends->{$dest}}, @{$destinations->{$dest}};
+          }
+        }
+        foreach my $dest (sort keys(%{$depends})) {
+          my @sourcechanged;
+          foreach my $source (@{$depends->{$dest}}) {
+            if (!defined($cache->{$stage}{"$dir/$source"})
+                || $cache->{$stage}{"$dir/$source"}
+                   ne $newcache->{$stage}{"$dir/$source"})
+            {
+              push @sourcechanged, "$dir/$source";
+            }
+          }
+          if (! -f "$dir/$dest" || scalar(@sourcechanged)) {
+  #          if ($njobs == 0) {
+  #            push @result, {
+  #              cmd => "ECHODIR $dir",
+  #            };
+  #          }
+            next if ($section->{onlyonce} && $njobs > 0);
+            push @result, {
+              dest => $dest,
+              cmd => do_transform($dir, $section, $depends->{$dest}, $dest),
+              dir => $dir,
+              reason => (! -f "$dir/$dest") ?
+                          "destination ($dest) absent" :
+                          "source changed (" .
+                          sourcechanged_string(@sourcechanged) . ")",
+              sources => [ @sourcechanged ],
+              stage => $stage,
+              parallel => $section->{parallel},
+            };
+            ++$njobs;
+          }
         }
       }
     }
@@ -321,7 +340,7 @@ sub derive_destinations
     $dest =~ s/\.java$/.class/;
     return { $dest => [ $source ] };
   } elsif ($dstfnc =~ s/^SHELL://) {
-    my $files = `cd $dir && $dstfnc`;
+    my $files = `export SOURCE=$source && cd $dir && $dstfnc`;
     my @files = split(/\n+/, $files);
     my $result = {};
     foreach my $file (@files) {
@@ -351,6 +370,8 @@ sub do_transform
     $transform =~ s/OUT/$dest/g;
     $transform =~ s/DIR/$dir/g;
     return $transform;
+  } else {
+    die "Unknown transform $transform in $dir";
   }
 }
 
@@ -370,13 +391,58 @@ sub execute_jobs
 {
   while (scalar(@jobs)) {
     my $job = shift @jobs;
-    execute_job($job);
+    if (defined($job->{parallel})) {
+      execute_jobs_parallel($job);
+    } else {
+      execute_job($job);
+    }
+  }
+}
+
+sub execute_jobs_parallel
+{
+  my $job = shift;
+  my @pool = ( $job );
+  my $njobs = int($job->{parallel});
+  for (my $i=0; $i < $njobs - 1 && $i < scalar(@jobs); $i++) {
+    if ($jobs[ $i ]->{stage} eq $job->{stage}
+        && $jobs[ $i ]->{dir} eq $job->{dir})
+    {
+      $job = shift @jobs;
+      push @pool, $job;
+    }
+  }
+  my %pids = ();
+  for (my $i=1; $i < scalar(@pool); $i++) {
+    my $job = $pool[ $i ];
+    my $pid = fork();
+    die "unable to fork: $!" unless defined($pid);
+    if (!$pid) {
+      execute_job($job);
+      exit 0;
+    } else {
+      $pids{$pid} = $job;
+    }
+  }
+  execute_job($pool[0]);
+  foreach $pid (@pids) {
+    my $child = waitpid $pid, 0;
+    my $exitcode = $?;
+    if (int($exitcode) != 0) {
+      print STDERR "Job $job->{cmd} in dir $job->{dir} exited with non zero.\n";
+      exit $exitcode;
+    }
   }
 }
 
 sub execute_job
 {
   my $job = shift;
+  if ($job->{cmd} =~ /^\s*$/) {
+    print STDERR "WTH?!\n";
+    print STDERR Dumper $job;
+    return;
+  }
   if ($job->{cmd} =~ s/ECHODIR //) {
     print "-- Directory: $job->{cmd}\n";
     return;
@@ -392,7 +458,11 @@ sub execute_job
   }
   if (system("cd $job->{dir}" . ' && ' . $cmd)) {
     if ($terse) {
-      print STDERR "ERROR: $cmd\n";
+      print STDERR "ERROR in directory $job->{dir}: $cmd\n";
+    }
+    ## rollback
+    foreach my $source (@{$job->{sources}}) {
+      delete $newcache->{$job->{stage}}{$source};
     }
     exit -1;
   }
