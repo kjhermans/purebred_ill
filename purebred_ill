@@ -48,7 +48,7 @@ $SIG{CHLD} = sub {
   while( ( my $child = waitpid( -1, &WNOHANG ) ) > 0 ) {
     my $exitcode = $?;
     if (int($exitcode)) {
-      print STDERR "Child $child exited with non zero";
+      print STDERR "Child $child exited with non zero.\n";
       exit -1;
     }
   }
